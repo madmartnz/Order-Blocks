@@ -1,0 +1,476 @@
+//@version=5
+// ─────────────────────────────────────────────────────────────────────────────
+// Order Block + OTE Strategy Tracker
+//
+// RUN THIS ON THE 1-MINUTE CHART.
+//
+//  1. A valid Bullish/Bearish Order Block forms on the 5m timeframe
+//     (liquidity-sweep OB or FVG-delivery OB – same logic as order_blocks.pine).
+//  2. On the 1m chart, wait for price to retrace into the OTE zone (0.62–0.79)
+//     of the range: swing extreme at the OB  ->  lowest low (bearish) /
+//     highest high (bullish) of the displacement.
+//  3. Inside the OTE, wait for an EXHAUSTION candle (long wick into the zone)
+//     and then a FLIP candle (closes beyond the previous candle's low/high).
+//  4. Enter at the close of the flip candle. Stop / target per the inputs.
+//
+// Results: TradingView Strategy Tester + an on-chart R-multiple table
+// (win rate, avg win/loss in R, expectancy, total R, drawdown) split by
+// All / Sweep OB / FVG OB.
+// ─────────────────────────────────────────────────────────────────────────────
+strategy("Order Block + OTE Strategy Tracker", shorttitle="OB-OTE", overlay=true, max_bars_back=500,
+     max_boxes_count=500, max_lines_count=500, max_labels_count=500,
+     initial_capital=100000, default_qty_type=strategy.fixed, default_qty_value=1,
+     pyramiding=0, process_orders_on_close=true, margin_long=0, margin_short=0)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+G0 = "Order block detection"
+obTf       = input.timeframe("5", "Order block timeframe", group=G0)
+sweepLen   = input.int(12, "Liquidity sweep lookback (bars)", minval=2, group=G0)
+pivLen     = input.int(3, "Swing pivot length (BOS)", minval=1, group=G0)
+atrLen     = input.int(14, "ATR length", minval=1, group=G0)
+dispMult   = input.float(1.2, "Displacement: min impulse body (x ATR)", minval=0.1, step=0.1, group=G0)
+minBodyPct = input.float(50.0, "Displacement: min body % of range", minval=0, maxval=100, group=G0)
+reqBOS     = input.bool(true, "Require Break of Structure", group=G0)
+reqFVG     = input.bool(true, "Require Fair Value Gap (sweep OBs)", group=G0)
+maxSeq     = input.int(5, "Max candles in a multi-candle OB", minval=1, group=G0)
+maxSkip    = input.int(1, "Max opposite candles between OB and impulse", minval=0, maxval=3, group=G0)
+useSweep   = input.bool(true, "Enable: liquidity-sweep OBs", group=G0)
+useFVG     = input.bool(true, "Enable: FVG-delivery OBs", group=G0)
+minFvgAtr  = input.float(0.1, "FVG: min gap size (x ATR)", minval=0.0, step=0.05, group=G0)
+fvgMaxAge  = input.int(150, "FVG: max age while waiting for a test (bars)", minval=5, group=G0)
+
+G1 = "Entry (chart timeframe, use 1m)"
+oteMin       = input.float(0.62, "OTE zone start (fib level)", minval=0.1, maxval=0.95, step=0.01, group=G1)
+oteMax       = input.float(0.79, "OTE zone end (fib level)", minval=0.1, maxval=0.99, step=0.01, group=G1)
+setupMaxBars = input.int(180, "Setup expires after (chart bars)", minval=5, group=G1)
+wickPct      = input.float(50.0, "Exhaustion: min wick % of candle range", minval=10, maxval=95, group=G1)
+minWickAtr   = input.float(0.25, "Exhaustion: min wick size (x ATR14)", minval=0, step=0.05, group=G1)
+exhWindow    = input.int(5, "Flip must occur within N bars of exhaustion", minval=0, group=G1)
+useSession   = input.bool(false, "Only take entries inside session", group=G1)
+sess         = input.session("0930-1600", "Entry session", group=G1)
+
+G2 = "Risk / target"
+stopMode  = input.string("OB zone edge", "Stop loss at", options=["OB zone edge", "Swing extreme (wick)", "Exhaustion wick"], group=G2)
+stopTicks = input.int(2, "Stop buffer (ticks)", minval=0, group=G2)
+tpMode    = input.string("Swing extreme", "Take profit at", options=["Swing extreme", "Fixed R multiple"], group=G2)
+tpExt     = input.float(0.0, "Swing target extension (0.27 = -0.27 fib extension)", minval=0.0, step=0.05, group=G2)
+tpR       = input.float(2.0, "Fixed R multiple", minval=0.1, step=0.1, group=G2)
+minRR     = input.float(1.0, "Skip trades with planned RR below", minval=0.0, step=0.1, group=G2)
+
+G3 = "Display"
+showTable = input.bool(true, "Show stats table", group=G3)
+showDraw  = input.bool(true, "Draw setups, trades and R labels", group=G3)
+bullCol   = input.color(#089981, "Bullish colour", group=G3)
+bearCol   = input.color(#f23645, "Bearish colour", group=G3)
+
+// ── Order block engine (runs on the 5m series via request.security) ─────────
+f_hi(int s) =>
+    float h = high
+    for j = 1 to s
+        h := math.max(h, high[j])
+    h
+
+f_lo(int s) =>
+    float l = low
+    for j = 1 to s
+        l := math.min(l, low[j])
+    l
+
+f_opp(bool isBull, int off) =>
+    isBull ? close[off] < open[off] : close[off] > open[off]
+
+// Sweep-type OB. Evaluated on the close of bar t. Impulse = bar t-1, FVG = bars t-2 / t.
+f_detect(bool isBull, float atrPrev, float phLvl, float plLvl) =>
+    bool  ok   = false
+    float zTop = na
+    float zBot = na
+    int   s    = 0
+    int   e    = -1
+    float impBody  = math.abs(close[1] - open[1])
+    float impRange = high[1] - low[1]
+    bool  dirOk    = isBull ? close[1] > open[1] : close[1] < open[1]
+    bool  dispOk   = dirOk and impRange > 0 and impBody >= dispMult * atrPrev and impBody >= minBodyPct / 100.0 * impRange
+    bool  fvgOk    = not reqFVG or (isBull ? low > high[2] : high < low[2])
+    float bosLvl   = isBull ? phLvl : plLvl
+    bool  bosOk    = not reqBOS or (not na(bosLvl) and (isBull ? close[1] > bosLvl : close[1] < bosLvl))
+    if dispOk and fvgOk and bosOk
+        for k = 2 to 2 + maxSkip
+            if f_opp(isBull, k)
+                e := k
+                break
+        if e > 0
+            s := e
+            while s - e + 1 < maxSeq and f_opp(isBull, s + 1)
+                s += 1
+            float ref = isBull ? low[s + 1] : high[s + 1]
+            for q = s + 2 to s + sweepLen
+                ref := isBull ? math.min(ref, low[q]) : math.max(ref, high[q])
+            int sw = -1
+            for j = s to e
+                bool swept = isBull ? low[j] < ref : high[j] > ref
+                if swept
+                    sw := j
+                    break
+            if sw > 0
+                if sw == e
+                    s := e
+                zTop := isBull ? open[e] : close[e]
+                zBot := isBull ? close[e] : open[e]
+                for j = s to e
+                    zTop := math.max(zTop, isBull ? open[j] : close[j])
+                    zBot := math.min(zBot, isBull ? close[j] : open[j])
+                bool valid   = isBull ? high[1] > zTop : low[1] < zBot
+                bool untaped = isBull ? low > zTop : high < zBot
+                ok := valid and untaped
+    [ok, zTop, zBot, s, e]
+
+// FVG-delivery OB: test candle(s) from first touch to previous bar, engulfed by the current bar.
+f_engulf(bool fBull, int fTouch) =>
+    bool  ok   = false
+    float zTop = na
+    float zBot = na
+    int   s    = fTouch >= 0 ? bar_index - fTouch : 0
+    if fTouch >= 0 and s >= 1 and s <= maxSeq
+        bool engBar = fBull ? close > open : close < open
+        if engBar
+            bool allOpp = true
+            for j = s to 1
+                if not f_opp(fBull, j)
+                    allOpp := false
+                    break
+            if allOpp
+                zTop := fBull ? open[1] : close[1]
+                zBot := fBull ? close[1] : open[1]
+                for j = s to 1
+                    zTop := math.max(zTop, fBull ? open[j] : close[j])
+                    zBot := math.min(zBot, fBull ? close[j] : open[j])
+                ok := fBull ? close > zTop : close < zBot
+    [ok, zTop, zBot, s]
+
+// Returns the LATEST order block: [id, isBull, bodyTop, bodyBottom, wickHigh, wickLow, kind(0 sweep/1 FVG), startTime]
+// wickHigh/wickLow = extremes from the first OB candle through the confirmation bar.
+f_engine() =>
+    var int   cnt   = 0
+    var bool  lBull = true
+    var float lTop  = na
+    var float lBot  = na
+    var float lHi   = na
+    var float lLo   = na
+    var int   lKind = 0
+    var int   lT    = 0
+    var float lastPH = na
+    var float lastPL = na
+    var int   trend  = 0
+    var int   lastBullEnd = -1
+    var int   lastBearEnd = -1
+    var array<float> fTop     = array.new<float>()
+    var array<float> fBot     = array.new<float>()
+    var array<bool>  fBull    = array.new<bool>()
+    var array<int>   fCreated = array.new<int>()
+    var array<int>   fTouch   = array.new<int>()
+
+    float atrV  = ta.atr(atrLen)
+    float phNew = ta.pivothigh(high, pivLen, pivLen)
+    float plNew = ta.pivotlow(low, pivLen, pivLen)
+    if not na(phNew)
+        lastPH := phNew
+    if not na(plNew)
+        lastPL := plNew
+    if not na(lastPH) and close > lastPH
+        trend := 1
+    else if not na(lastPL) and close < lastPL
+        trend := -1
+
+    [bOk, bTop, bBot, bS, bE] = f_detect(true, atrV[1], lastPH, lastPL)
+    [sOk, sTop, sBot, sS, sE] = f_detect(false, atrV[1], lastPH, lastPL)
+    bool conf = barstate.isconfirmed
+
+    if conf and useSweep and bOk and bar_index - bE != lastBullEnd
+        lastBullEnd := bar_index - bE
+        cnt += 1
+        lBull := true
+        lTop := bTop
+        lBot := bBot
+        lHi := f_hi(bS)
+        lLo := f_lo(bS)
+        lKind := 0
+        lT := time[bS]
+    if conf and useSweep and sOk and bar_index - sE != lastBearEnd
+        lastBearEnd := bar_index - sE
+        cnt += 1
+        lBull := false
+        lTop := sTop
+        lBot := sBot
+        lHi := f_hi(sS)
+        lLo := f_lo(sS)
+        lKind := 0
+        lT := time[sS]
+
+    if conf and useFVG
+        int n = array.size(fTop)
+        if n > 0
+            for i = n - 1 to 0
+                bool  fb = array.get(fBull, i)
+                int   fc = array.get(fCreated, i)
+                int   ft = array.get(fTouch, i)
+                float tp = array.get(fTop, i)
+                float bt = array.get(fBot, i)
+                bool  rm = false
+                [fOk, zT, zB, zS] = f_engulf(fb, ft)
+                if fOk
+                    cnt += 1
+                    lBull := fb
+                    lTop := zT
+                    lBot := zB
+                    lHi := f_hi(zS)
+                    lLo := f_lo(zS)
+                    lKind := 1
+                    lT := time[zS]
+                    rm := true
+                if not rm and ft < 0 and bar_index > fc
+                    if (fb ? low <= tp : high >= bt)
+                        array.set(fTouch, i, bar_index)
+                        ft := bar_index
+                bool oppNow = fb ? close < open : close > open
+                bool filled = fb ? close < bt : close > tp
+                if ft >= 0 and not oppNow
+                    rm := true
+                if ft >= 0 and bar_index - ft >= maxSeq
+                    rm := true
+                if filled
+                    rm := true
+                if bar_index - fc > fvgMaxAge
+                    rm := true
+                if rm
+                    array.remove(fTop, i)
+                    array.remove(fBot, i)
+                    array.remove(fBull, i)
+                    array.remove(fCreated, i)
+                    array.remove(fTouch, i)
+        float minGap = minFvgAtr * atrV
+        if trend == 1 and close[1] > open[1] and low > high[2] and low - high[2] >= minGap
+            array.push(fTop, low)
+            array.push(fBot, high[2])
+            array.push(fBull, true)
+            array.push(fCreated, bar_index)
+            array.push(fTouch, -1)
+        if trend == -1 and close[1] < open[1] and high < low[2] and low[2] - high >= minGap
+            array.push(fTop, low[2])
+            array.push(fBot, high)
+            array.push(fBull, false)
+            array.push(fCreated, bar_index)
+            array.push(fTouch, -1)
+        if array.size(fTop) > 40
+            array.remove(fTop, 0)
+            array.remove(fBot, 0)
+            array.remove(fBull, 0)
+            array.remove(fCreated, 0)
+            array.remove(fTouch, 0)
+
+    [cnt, lBull, lTop, lBot, lHi, lLo, lKind, lT]
+
+[evId, evBull, evTop, evBot, evHi, evLo, evKind, evT] = request.security(syminfo.tickerid, obTf, f_engine(), lookahead=barmerge.lookahead_off)
+
+// ── Setup / trade state (chart timeframe) ───────────────────────────────────
+float atrC = ta.atr(14)
+bool  inSess = not useSession or not na(time(timeframe.period, sess))
+float buf = stopTicks * syminfo.mintick
+
+var int   lastEv = 0
+var bool  sOn = false
+var bool  sShort = false
+var bool  sArmed = false
+var int   sKind = 0
+var int   sBorn = 0
+var float sTop = na
+var float sBot = na
+var float sHi = na
+var float sLo = na
+var int   exhBar = -1
+var float exhExt = na
+var box   bxOB = na
+var box   bxOTE = na
+var line  lnE = na
+var line  lnS = na
+var line  lnT = na
+var bool  tradeLive = false
+
+// Trade log (index = trade number) and statistics (0 = all, 1 = sweep OB, 2 = FVG OB)
+var array<float> tRisk = array.new<float>()
+var array<int>   tKind = array.new<int>()
+var array<float> tPlan = array.new<float>()
+var array<float> stN    = array.new<float>(3, 0.0)
+var array<float> stW    = array.new<float>(3, 0.0)
+var array<float> stSumW = array.new<float>(3, 0.0)
+var array<float> stSumL = array.new<float>(3, 0.0)
+var array<float> stTot  = array.new<float>(3, 0.0)
+var int   lastClosed = 0
+var float cumR = 0.0
+var float peakR = 0.0
+var float maxDD = 0.0
+
+// 1) Account for trades that closed
+int nClosed = strategy.closedtrades
+if nClosed > lastClosed
+    for i = lastClosed to nClosed - 1
+        float ex = strategy.closedtrades.exit_price(i)
+        float en = strategy.closedtrades.entry_price(i)
+        float sgn = strategy.closedtrades.size(i) > 0 ? 1.0 : -1.0
+        float rk = array.get(tRisk, i)
+        int   kd = array.get(tKind, i)
+        float r = rk > 0 ? sgn * (ex - en) / rk : 0.0
+        for c = 0 to 1
+            int idx = c == 0 ? 0 : kd + 1
+            array.set(stN, idx, array.get(stN, idx) + 1)
+            if r > 0
+                array.set(stW, idx, array.get(stW, idx) + 1)
+                array.set(stSumW, idx, array.get(stSumW, idx) + r)
+            else
+                array.set(stSumL, idx, array.get(stSumL, idx) - r)
+            array.set(stTot, idx, array.get(stTot, idx) + r)
+        cumR += r
+        peakR := math.max(peakR, cumR)
+        maxDD := math.max(maxDD, peakR - cumR)
+        if showDraw
+            label.new(bar_index, ex, (r > 0 ? "+" : "") + str.tostring(math.round(r, 2)) + "R", style=r > 0 ? label.style_label_down : label.style_label_up, color=r > 0 ? color.new(bullCol, 10) : color.new(bearCol, 10), textcolor=color.white, size=size.small)
+    lastClosed := nClosed
+    tradeLive := false
+
+// 2) New 5m order block -> new setup (ignored while a trade is open)
+if evId != lastEv
+    lastEv := evId
+    if strategy.position_size == 0
+        if sOn
+            if not na(bxOB)
+                box.delete(bxOB)
+            if not na(bxOTE)
+                box.delete(bxOTE)
+        sOn := true
+        sShort := not evBull
+        sArmed := false
+        sKind := evKind
+        sBorn := bar_index
+        sTop := evTop
+        sBot := evBot
+        sHi := evHi
+        sLo := evLo
+        exhBar := -1
+        exhExt := na
+        if showDraw
+            color c = sShort ? bearCol : bullCol
+            bxOB := box.new(evT, evTop, time, evBot, xloc=xloc.bar_time, border_color=c, bgcolor=color.new(c, 85), text=(sShort ? "Bear OB" : "Bull OB") + (evKind == 0 ? " (Sweep)" : " (FVG)"), text_color=c, text_size=size.tiny, text_halign=text.align_left)
+            bxOTE := box.new(time, evTop, time, evBot, xloc=xloc.bar_time, border_color=color.new(color.orange, 40), bgcolor=color.new(color.orange, 85), text="OTE", text_color=color.orange, text_size=size.tiny, text_halign=text.align_right)
+
+// 3) Manage the active setup
+if sOn and bar_index > sBorn
+    bool sh = sShort
+    // The range extends with the displacement until price first retraces into the OTE
+    if not sArmed
+        if sh
+            sLo := math.min(sLo, low)
+        else
+            sHi := math.max(sHi, high)
+    float R = sHi - sLo
+    float lvlMin = sh ? sLo + oteMin * R : sHi - oteMin * R
+    float lvlMax = sh ? sLo + oteMax * R : sHi - oteMax * R
+    bool broken  = sh ? high > sHi : low < sLo
+    bool expired = bar_index - sBorn > setupMaxBars
+    if not sArmed and (sh ? high >= lvlMin : low <= lvlMin)
+        sArmed := true
+
+    if broken or expired
+        sOn := false
+        if not na(bxOB)
+            box.delete(bxOB)
+        if not na(bxOTE)
+            box.delete(bxOTE)
+    else
+        if not na(bxOB)
+            box.set_right(bxOB, time)
+        if not na(bxOTE)
+            box.set_right(bxOTE, time)
+            box.set_top(bxOTE, math.max(lvlMin, lvlMax))
+            box.set_bottom(bxOTE, math.min(lvlMin, lvlMax))
+        if sArmed
+            // Exhaustion: long wick into the OTE zone
+            float rng  = high - low
+            float wick = sh ? high - math.max(open, close) : math.min(open, close) - low
+            bool touch = sh ? high >= lvlMin : low <= lvlMin
+            if rng > 0 and touch and wick >= wickPct / 100.0 * rng and wick >= minWickAtr * atrC
+                if exhBar < 0 or bar_index - exhBar > exhWindow
+                    exhExt := sh ? high : low
+                else
+                    exhExt := sh ? math.max(exhExt, high) : math.min(exhExt, low)
+                exhBar := bar_index
+            // Flip: candle closes back in the trend direction beyond the prior candle's extreme
+            bool flip = sh ? (close < open and close < low[1]) : (close > open and close > high[1])
+            bool exhFresh = exhBar >= 0 and bar_index - exhBar <= exhWindow
+            if flip and exhFresh and inSess and strategy.position_size == 0
+                float entry = close
+                float stopP = na
+                if sh
+                    stopP := stopMode == "OB zone edge" ? sTop + buf : stopMode == "Swing extreme (wick)" ? sHi + buf : exhExt + buf
+                else
+                    stopP := stopMode == "OB zone edge" ? sBot - buf : stopMode == "Swing extreme (wick)" ? sLo - buf : exhExt - buf
+                float risk = sh ? stopP - entry : entry - stopP
+                float tgt = na
+                if tpMode == "Fixed R multiple"
+                    tgt := sh ? entry - tpR * risk : entry + tpR * risk
+                else
+                    tgt := sh ? sLo - tpExt * R : sHi + tpExt * R
+                float reward = sh ? entry - tgt : tgt - entry
+                if risk > 0 and reward > 0 and reward / risk >= minRR
+                    strategy.entry(sh ? "Short" : "Long", sh ? strategy.short : strategy.long)
+                    strategy.exit("Exit", sh ? "Short" : "Long", stop=stopP, limit=tgt)
+                    array.push(tRisk, risk)
+                    array.push(tKind, sKind)
+                    array.push(tPlan, reward / risk)
+                    sOn := false
+                    tradeLive := true
+                    if showDraw
+                        lnE := line.new(bar_index, entry, bar_index, entry, color=color.gray, style=line.style_dotted)
+                        lnS := line.new(bar_index, stopP, bar_index, stopP, color=bearCol, style=line.style_dashed)
+                        lnT := line.new(bar_index, tgt, bar_index, tgt, color=bullCol, style=line.style_dashed)
+
+// 4) Extend trade lines while the trade is live
+if tradeLive and showDraw
+    if not na(lnE)
+        line.set_x2(lnE, bar_index)
+    if not na(lnS)
+        line.set_x2(lnS, bar_index)
+    if not na(lnT)
+        line.set_x2(lnT, bar_index)
+
+// ── Stats table ─────────────────────────────────────────────────────────────
+var table tbl = table.new(position.top_right, 4, 11, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.new(color.gray, 50))
+if barstate.islast and showTable
+    color tc = color.white
+    table.cell(tbl, 0, 0, "OB + OTE (R-multiples)", text_color=tc, text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 1, 0, "All", text_color=tc, text_size=size.small)
+    table.cell(tbl, 2, 0, "Sweep OB", text_color=tc, text_size=size.small)
+    table.cell(tbl, 3, 0, "FVG OB", text_color=tc, text_size=size.small)
+    string[] lbl = array.from("Trades", "Win rate", "Avg win (R)", "Avg loss (R)", "Expectancy (R)", "Total R", "Profit factor")
+    for r = 0 to 6
+        table.cell(tbl, 0, r + 1, array.get(lbl, r), text_color=tc, text_size=size.small, text_halign=text.align_left)
+    for c = 0 to 2
+        float n  = array.get(stN, c)
+        float w  = array.get(stW, c)
+        float sw = array.get(stSumW, c)
+        float sl = array.get(stSumL, c)
+        float tot = array.get(stTot, c)
+        float l = n - w
+        table.cell(tbl, c + 1, 1, str.tostring(n, "#"), text_color=tc, text_size=size.small)
+        table.cell(tbl, c + 1, 2, n > 0 ? str.tostring(w / n * 100, "#.#") + "%" : "-", text_color=tc, text_size=size.small)
+        table.cell(tbl, c + 1, 3, w > 0 ? str.tostring(sw / w, "#.##") : "-", text_color=tc, text_size=size.small)
+        table.cell(tbl, c + 1, 4, l > 0 ? "-" + str.tostring(sl / l, "#.##") : "-", text_color=tc, text_size=size.small)
+        table.cell(tbl, c + 1, 5, n > 0 ? str.tostring(tot / n, "#.##") : "-", text_color=tot > 0 ? color.lime : tot < 0 ? color.red : tc, text_size=size.small)
+        table.cell(tbl, c + 1, 6, str.tostring(tot, "#.##"), text_color=tot > 0 ? color.lime : tot < 0 ? color.red : tc, text_size=size.small)
+        table.cell(tbl, c + 1, 7, sl > 0 ? str.tostring(sw / sl, "#.##") : "-", text_color=tc, text_size=size.small)
+    table.cell(tbl, 0, 8, "Avg planned RR", text_color=tc, text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 1, 8, array.size(tPlan) > 0 ? str.tostring(array.avg(tPlan), "#.##") : "-", text_color=tc, text_size=size.small)
+    table.cell(tbl, 0, 9, "Max drawdown (R)", text_color=tc, text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 1, 9, str.tostring(maxDD, "#.##"), text_color=tc, text_size=size.small)
+    string status = not sOn ? "No active setup" : (sShort ? "SHORT" : "LONG") + (sArmed ? " - in OTE, waiting for exhaustion + flip" : " - waiting for OTE")
+    table.cell(tbl, 0, 10, "Status", text_color=tc, text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 1, 10, status, text_color=tc, text_size=size.small, text_halign=text.align_left)
+    table.merge_cells(tbl, 1, 10, 3, 10)
