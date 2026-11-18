@@ -23,6 +23,12 @@ reqFVG     = input.bool(true, "Require Fair Value Gap", group=G1)
 maxSeq     = input.int(5, "Max candles in a multi-candle OB", minval=1, group=G1)
 maxSkip    = input.int(1, "Max opposite candles allowed between OB and impulse", minval=0, maxval=3, group=G1)
 
+G3 = "Order block types"
+useSweep  = input.bool(true, "Enable: Liquidity-sweep order blocks", group=G3)
+useFVG    = input.bool(true, "Enable: FVG-delivery order blocks", group=G3, tooltip="In an uptrend, an unmitigated bullish FVG is tested by bearish candle(s); a bullish candle then engulfs them and they become a bullish OB. Mirrored for bearish.")
+minFvgAtr = input.float(0.1, "FVG: min gap size (x ATR)", minval=0.0, step=0.05, group=G3)
+fvgMaxAge = input.int(150, "FVG: max age while waiting for a test (bars)", minval=5, group=G3)
+
 G2 = "Mitigation / Display"
 mitMode  = input.string("Touch zone", "Mitigated when", options=["Touch zone", "Close beyond 50%"], group=G2, tooltip="A zone is also always retired if price closes beyond the stop-loss side of the zone.")
 hideMit  = input.bool(false, "Delete mitigated zones (otherwise grey them out)", group=G2)
@@ -45,8 +51,18 @@ type OB
     line  midL
     line  slL
     line  riseL
+    int   born
 
-var array<OB> obs = array.new<OB>()
+type FVG
+    bool  bull
+    float top
+    float bot
+    int   created
+    int   touch   // bar index of first entry into the gap, -1 = untouched
+
+var array<OB>  obs  = array.new<OB>()
+var array<FVG> fvgs = array.new<FVG>()
+var int trend = 0   // +1 after a close above the last swing high, -1 after a close below the last swing low
 var float lastPH = na
 var float lastPL = na
 var int lastBullEnd = -1
@@ -64,6 +80,10 @@ if not na(phNew)
     lastPH := phNew
 if not na(plNew)
     lastPL := plNew
+if not na(lastPH) and close > lastPH
+    trend := 1
+else if not na(lastPL) and close < lastPL
+    trend := -1
 
 // ── Detection ────────────────────────────────────────────────────────────────
 // Evaluated on the close of bar t. Impulse candle = bar t-1 (offset 1), the FVG
@@ -122,17 +142,47 @@ f_detect(bool isBull) =>
                 ok := valid and untaped
     [ok, zTop, zBot, s, e]
 
+// ── FVG engulfing check ──────────────────────────────────────────────────────
+// For a tested FVG: the candles from the first-touch bar up to the previous bar
+// must all be opposing candles (bearish for a bullish FVG). The current bar must
+// be a candle in the FVG's direction whose close engulfs them (closes beyond the
+// body extreme of the run). Returns [found, zoneTop, zoneBottom, offsetOfFirstTestCandle]
+f_opp(bool isBull, int off) =>
+    isBull ? close[off] < open[off] : close[off] > open[off]
+
+f_engulf(FVG f) =>
+    bool  ok   = false
+    float zTop = na
+    float zBot = na
+    int   s    = f.touch >= 0 ? bar_index - f.touch : 0
+    if f.touch >= 0 and s >= 1 and s <= maxSeq
+        bool engBar = f.bull ? close > open : close < open
+        if engBar
+            bool allOpp = true
+            for j = s to 1
+                if not f_opp(f.bull, j)
+                    allOpp := false
+                    break
+            if allOpp
+                zTop := f.bull ? open[1] : close[1]
+                zBot := f.bull ? close[1] : open[1]
+                for j = s to 1
+                    zTop := math.max(zTop, f.bull ? open[j] : close[j])
+                    zBot := math.min(zBot, f.bull ? close[j] : open[j])
+                ok := f.bull ? close > zTop : close < zBot
+    [ok, zTop, zBot, s]
+
 // ── Drawing ──────────────────────────────────────────────────────────────────
-f_add(bool isBull, float t, float b, int leftBar) =>
+f_add(bool isBull, float t, float b, int leftBar, string kind) =>
     color c   = isBull ? bullCol : bearCol
     float mid = (t + b) / 2.0
     float slP = isBull ? b - slBuf : t + slBuf
     float rsP = isBull ? mid - slBuf : mid + slBuf
-    box bx = box.new(leftBar, t, bar_index, b, border_color=c, bgcolor=color.new(c, fillTr), text=isBull ? "Bull OB" : "Bear OB", text_color=c, text_size=size.tiny, text_halign=text.align_right)
+    box bx = box.new(leftBar, t, bar_index, b, border_color=c, bgcolor=color.new(c, fillTr), text=(isBull ? "Bull OB" : "Bear OB") + " (" + kind + ")", text_color=c, text_size=size.tiny, text_halign=text.align_right)
     line ml = showMid ? line.new(leftBar, mid, bar_index, mid, color=c, style=line.style_dotted) : na
     line sl = showSL ? line.new(leftBar, slP, bar_index, slP, color=color.new(c, 0), style=line.style_dashed) : na
     line rl = showRise ? line.new(leftBar, rsP, bar_index, rsP, color=color.new(c, 40), style=line.style_dashed) : na
-    array.push(obs, OB.new(isBull, t, b, false, bx, ml, sl, rl))
+    array.push(obs, OB.new(isBull, t, b, false, bx, ml, sl, rl, bar_index))
     if array.size(obs) > maxKeep
         OB old = array.shift(obs)
         box.delete(old.bx)
@@ -160,21 +210,70 @@ bool newBull = false
 bool newBear = false
 bool mitNow  = false
 
-if bOk and bar_index - bE != lastBullEnd
+if useSweep and bOk and bar_index - bE != lastBullEnd
     lastBullEnd := bar_index - bE
     newBull := true
-    f_add(true, bTop, bBot, bar_index - bS)
+    f_add(true, bTop, bBot, bar_index - bS, "Sweep")
 
-if sOk and bar_index - sE != lastBearEnd
+if useSweep and sOk and bar_index - sE != lastBearEnd
     lastBearEnd := bar_index - sE
     newBear := true
-    f_add(false, sTop, sBot, bar_index - sS)
+    f_add(false, sTop, sBot, bar_index - sS, "Sweep")
+
+// ── FVG-delivery order blocks ────────────────────────────────────────────────
+// 1) Existing FVGs are processed first (using state from prior bars).
+// 2) A new FVG is registered afterwards, so it can only be tested on later bars.
+if useFVG
+    if array.size(fvgs) > 0
+        for i = array.size(fvgs) - 1 to 0
+            FVG f = array.get(fvgs, i)
+            bool rm = false
+
+            // Engulfing bar closes the setup -> test candle(s) become the OB
+            [fOk, fTop, fBot, fS] = f_engulf(f)
+            if fOk
+                if f.bull
+                    newBull := true
+                else
+                    newBear := true
+                f_add(f.bull, fTop, fBot, bar_index - fS, "FVG")
+                rm := true
+
+            // First entry into the gap = the test
+            if not rm and f.touch < 0 and bar_index > f.created
+                if (f.bull ? low <= f.top : high >= f.bot)
+                    f.touch := bar_index
+
+            bool oppNow = f.bull ? close < open : close > open
+            bool filled = f.bull ? close < f.bot : close > f.top
+            // Tested, but this bar is not an opposing candle (and did not engulf) -> setup failed
+            if f.touch >= 0 and not oppNow
+                rm := true
+            // Test run too long to qualify
+            if f.touch >= 0 and bar_index - f.touch >= maxSeq
+                rm := true
+            // Gap fully filled -> mitigated
+            if filled
+                rm := true
+            // Never tested within max age
+            if bar_index - f.created > fvgMaxAge
+                rm := true
+            if rm
+                array.remove(fvgs, i)
+
+    float minGap = minFvgAtr * atrV
+    if trend == 1 and close[1] > open[1] and low > high[2] and low - high[2] >= minGap
+        array.push(fvgs, FVG.new(true, low, high[2], bar_index, -1))
+    if trend == -1 and close[1] < open[1] and high < low[2] and low[2] - high >= minGap
+        array.push(fvgs, FVG.new(false, low[2], high, bar_index, -1))
+    if array.size(fvgs) > 40
+        array.shift(fvgs)
 
 // Update / mitigate existing zones
 if array.size(obs) > 0
     for i = array.size(obs) - 1 to 0
         OB o = array.get(obs, i)
-        if not o.mit
+        if not o.mit and bar_index > o.born
             float mid = (o.top + o.bot) / 2.0
             bool tapped = false
             if mitMode == "Touch zone"
