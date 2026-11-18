@@ -1,0 +1,218 @@
+//@version=5
+// ─────────────────────────────────────────────────────────────────────────────
+// Order Blocks – Liquidity Sweep + Displacement (BOS) + FVG, unmitigated only
+// Built for day trading on the 5 minute chart (works on other timeframes too).
+//
+// Bullish OB : last down-close candle(s) that sweep a prior low, followed by an
+//              impulsive up candle that breaks structure and leaves an FVG.
+// Bearish OB : last up-close candle(s) that sweep a prior high, followed by an
+//              impulsive down candle that breaks structure and leaves an FVG.
+// Zones use candle BODIES only (open/close), never wicks.
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("Order Blocks (Sweep + Displacement + FVG)", shorttitle="OB", overlay=true, max_bars_back=500, max_boxes_count=500, max_lines_count=500)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+G1 = "Detection"
+sweepLen   = input.int(12, "Liquidity sweep lookback (bars)", minval=2, group=G1, tooltip="The OB candle(s) must trade beyond the lowest low (bull) / highest high (bear) of this many bars before the sequence. 12 bars = 1 hour on 5m.")
+pivLen     = input.int(3, "Swing pivot length (for BOS)", minval=1, group=G1, tooltip="Bars each side used to define the swing high/low that the impulse must break.")
+atrLen     = input.int(14, "ATR length", minval=1, group=G1)
+dispMult   = input.float(1.2, "Displacement: min impulse body (x ATR)", minval=0.1, step=0.1, group=G1)
+minBodyPct = input.float(50.0, "Displacement: min body % of candle range", minval=0, maxval=100, group=G1, tooltip="Filters out impulse candles that are mostly wick.")
+reqBOS     = input.bool(true, "Require Break of Structure", group=G1)
+reqFVG     = input.bool(true, "Require Fair Value Gap", group=G1)
+maxSeq     = input.int(5, "Max candles in a multi-candle OB", minval=1, group=G1)
+maxSkip    = input.int(1, "Max opposite candles allowed between OB and impulse", minval=0, maxval=3, group=G1)
+
+G2 = "Mitigation / Display"
+mitMode  = input.string("Touch zone", "Mitigated when", options=["Touch zone", "Close beyond 50%"], group=G2, tooltip="A zone is also always retired if price closes beyond the stop-loss side of the zone.")
+hideMit  = input.bool(false, "Delete mitigated zones (otherwise grey them out)", group=G2)
+maxKeep  = input.int(20, "Max zones kept on chart", minval=1, maxval=100, group=G2)
+showMid  = input.bool(true, "Show 50% mean threshold", group=G2)
+showSL   = input.bool(true, "Show stop-loss line", group=G2)
+showRise = input.bool(true, "Show 'raise stop' line (just beyond 50%)", group=G2)
+slTicks  = input.int(2, "Stop / raise-stop buffer (ticks)", minval=0, group=G2)
+bullCol  = input.color(#089981, "Bullish colour", group=G2)
+bearCol  = input.color(#f23645, "Bearish colour", group=G2)
+fillTr   = input.int(85, "Zone fill transparency", minval=0, maxval=100, group=G2)
+
+// ── State ────────────────────────────────────────────────────────────────────
+type OB
+    bool  bull
+    float top
+    float bot
+    bool  mit
+    box   bx
+    line  midL
+    line  slL
+    line  riseL
+
+var array<OB> obs = array.new<OB>()
+var float lastPH = na
+var float lastPL = na
+var int lastBullEnd = -1
+var int lastBearEnd = -1
+
+float slBuf = slTicks * syminfo.mintick
+
+// ── Series ───────────────────────────────────────────────────────────────────
+float atrV     = ta.atr(atrLen)
+float refLowS  = ta.lowest(low, sweepLen)
+float refHighS = ta.highest(high, sweepLen)
+float phNew    = ta.pivothigh(high, pivLen, pivLen)
+float plNew    = ta.pivotlow(low, pivLen, pivLen)
+if not na(phNew)
+    lastPH := phNew
+if not na(plNew)
+    lastPL := plNew
+
+// ── Detection ────────────────────────────────────────────────────────────────
+// Evaluated on the close of bar t. Impulse candle = bar t-1 (offset 1), the FVG
+// is formed by bar t-2 (offset 2) and bar t (offset 0). Nothing is repainted
+// after a zone is drawn.
+// Returns [found, zoneTop, zoneBottom, offsetOfOldestCandle, offsetOfNewestCandle]
+f_detect(bool isBull) =>
+    bool  ok   = false
+    float zTop = na
+    float zBot = na
+    int   s    = 0
+    int   e    = -1
+
+    float impBody  = math.abs(close[1] - open[1])
+    float impRange = high[1] - low[1]
+    bool  dirOk    = isBull ? close[1] > open[1] : close[1] < open[1]
+    bool  dispOk   = dirOk and impRange > 0 and impBody >= dispMult * atrV[1] and impBody >= minBodyPct / 100.0 * impRange
+    bool  fvgOk    = not reqFVG or (isBull ? low > high[2] : high < low[2])
+    float bosLvl   = isBull ? lastPH : lastPL
+    bool  bosOk    = not reqBOS or (not na(bosLvl) and (isBull ? close[1] > bosLvl : close[1] < bosLvl))
+
+    if dispOk and fvgOk and bosOk
+        // 1) last opposing candle before the impulse
+        for k = 2 to 2 + maxSkip
+            if (isBull and close[k] < open[k]) or (not isBull and close[k] > open[k])
+                e := k
+                break
+        if e > 0
+            // 2) extend back over consecutive opposing candles
+            s := e
+            while s - e + 1 < maxSeq and ((isBull and close[s + 1] < open[s + 1]) or (not isBull and close[s + 1] > open[s + 1]))
+                s += 1
+            // 3) liquidity sweep vs the window BEFORE the sequence
+            float ref = isBull ? refLowS[s + 1] : refHighS[s + 1]
+            int sw = -1
+            for j = s to e
+                bool swept = isBull ? low[j] < ref : high[j] > ref
+                if swept
+                    sw := j
+                    break
+            if sw > 0
+                // Isolated grab (only the final candle swept) -> final candle only
+                // Continuous sweep (an earlier candle already swept) -> whole sequence
+                if sw == e
+                    s := e
+                // 4) zone from candle BODIES only
+                zTop := isBull ? open[e] : close[e]
+                zBot := isBull ? close[e] : open[e]
+                for j = s to e
+                    zTop := math.max(zTop, isBull ? open[j] : close[j])
+                    zBot := math.min(zBot, isBull ? close[j] : open[j])
+                // 5) validation: impulse trades through the OB body extreme,
+                //    and the zone is still untouched on the confirmation bar
+                bool valid   = isBull ? high[1] > zTop : low[1] < zBot
+                bool untaped = isBull ? low > zTop : high < zBot
+                ok := valid and untaped
+    [ok, zTop, zBot, s, e]
+
+// ── Drawing ──────────────────────────────────────────────────────────────────
+f_add(bool isBull, float t, float b, int leftBar) =>
+    color c   = isBull ? bullCol : bearCol
+    float mid = (t + b) / 2.0
+    float slP = isBull ? b - slBuf : t + slBuf
+    float rsP = isBull ? mid - slBuf : mid + slBuf
+    box bx = box.new(leftBar, t, bar_index, b, border_color=c, bgcolor=color.new(c, fillTr), text=isBull ? "Bull OB" : "Bear OB", text_color=c, text_size=size.tiny, text_halign=text.align_right)
+    line ml = showMid ? line.new(leftBar, mid, bar_index, mid, color=c, style=line.style_dotted) : na
+    line sl = showSL ? line.new(leftBar, slP, bar_index, slP, color=color.new(c, 0), style=line.style_dashed) : na
+    line rl = showRise ? line.new(leftBar, rsP, bar_index, rsP, color=color.new(c, 40), style=line.style_dashed) : na
+    array.push(obs, OB.new(isBull, t, b, false, bx, ml, sl, rl))
+    if array.size(obs) > maxKeep
+        OB old = array.shift(obs)
+        box.delete(old.bx)
+        if not na(old.midL)
+            line.delete(old.midL)
+        if not na(old.slL)
+            line.delete(old.slL)
+        if not na(old.riseL)
+            line.delete(old.riseL)
+
+f_remove(OB o) =>
+    box.delete(o.bx)
+    if not na(o.midL)
+        line.delete(o.midL)
+    if not na(o.slL)
+        line.delete(o.slL)
+    if not na(o.riseL)
+        line.delete(o.riseL)
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+[bOk, bTop, bBot, bS, bE] = f_detect(true)
+[sOk, sTop, sBot, sS, sE] = f_detect(false)
+
+bool newBull = false
+bool newBear = false
+bool mitNow  = false
+
+if bOk and bar_index - bE != lastBullEnd
+    lastBullEnd := bar_index - bE
+    newBull := true
+    f_add(true, bTop, bBot, bar_index - bS)
+
+if sOk and bar_index - sE != lastBearEnd
+    lastBearEnd := bar_index - sE
+    newBear := true
+    f_add(false, sTop, sBot, bar_index - sS)
+
+// Update / mitigate existing zones
+if array.size(obs) > 0
+    for i = array.size(obs) - 1 to 0
+        OB o = array.get(obs, i)
+        if not o.mit
+            float mid = (o.top + o.bot) / 2.0
+            bool tapped = false
+            if mitMode == "Touch zone"
+                tapped := o.bull ? low <= o.top : high >= o.bot
+            else
+                tapped := o.bull ? close < mid : close > mid
+            bool broken = o.bull ? close < o.bot : close > o.top
+            if tapped or broken
+                o.mit := true
+                mitNow := true
+            if o.mit
+                if hideMit
+                    f_remove(o)
+                    array.remove(obs, i)
+                else
+                    box.set_right(o.bx, bar_index)
+                    box.set_bgcolor(o.bx, color.new(color.gray, 90))
+                    box.set_border_color(o.bx, color.new(color.gray, 50))
+                    box.set_text_color(o.bx, color.gray)
+                    if not na(o.midL)
+                        line.set_x2(o.midL, bar_index)
+                        line.set_color(o.midL, color.new(color.gray, 60))
+                    if not na(o.slL)
+                        line.set_x2(o.slL, bar_index)
+                        line.set_color(o.slL, color.new(color.gray, 60))
+                    if not na(o.riseL)
+                        line.set_x2(o.riseL, bar_index)
+                        line.set_color(o.riseL, color.new(color.gray, 70))
+            else
+                box.set_right(o.bx, bar_index)
+                if not na(o.midL)
+                    line.set_x2(o.midL, bar_index)
+                if not na(o.slL)
+                    line.set_x2(o.slL, bar_index)
+                if not na(o.riseL)
+                    line.set_x2(o.riseL, bar_index)
+
+// ── Alerts ───────────────────────────────────────────────────────────────────
+alertcondition(newBull, "New Bullish Order Block", "New bullish order block formed on {{ticker}} {{interval}}")
+alertcondition(newBear, "New Bearish Order Block", "New bearish order block formed on {{ticker}} {{interval}}")
+alertcondition(mitNow, "Order Block mitigated", "An order block was mitigated on {{ticker}} {{interval}}")
